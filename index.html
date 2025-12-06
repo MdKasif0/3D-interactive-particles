@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Particle Phantom - Saturn God Mode</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- MediaPipe Hands -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Courier New', Courier, monospace;
+        }
+        #canvas-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+        }
+        #input-video {
+            position: absolute;
+            bottom: 10px;
+            right: 10px;
+            width: 160px;
+            height: 120px;
+            z-index: 2;
+            opacity: 0.5;
+            transform: scaleX(-1); /* Mirror video */
+            border: 1px solid #333;
+            border-radius: 8px;
+        }
+        #ui-overlay {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 10;
+            color: rgba(255, 255, 255, 0.8);
+            pointer-events: none;
+        }
+        .hud-line {
+            display: block;
+            margin-bottom: 5px;
+            text-shadow: 0 0 5px rgba(0, 255, 255, 0.5);
+        }
+        .hud-title {
+            font-size: 1.5rem;
+            font-weight: bold;
+            letter-spacing: 2px;
+            color: #fff;
+            text-shadow: 0 0 10px #0ff;
+        }
+        .hud-status {
+            font-size: 0.8rem;
+            color: #aaa;
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 24px;
+            z-index: 20;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loading">
+        INITIALIZING SYSTEMS...<br>
+        <span style="font-size:14px; color: #888;">Please allow camera access</span>
+    </div>
+
+    <div id="ui-overlay">
+        <div class="hud-title">PARTICLE // PHANTOM</div>
+        <div class="hud-line hud-status" id="status-text">SYSTEM: STANDBY</div>
+        <div class="hud-line hud-status">FPS: <span id="fps-counter">0</span></div>
+        <div class="hud-line hud-status">PARTICLES: 75,000</div>
+        <div class="hud-line hud-status" style="margin-top: 10px; color: #0ff;">
+            CONTROLS:<br>
+            [OPEN HAND] :: EXPLODE<br>
+            [CLOSED HAND] :: REFORM<br>
+            [MOVE HAND] :: ROTATE
+        </div>
+    </div>
+
+    <!-- Hidden video element for MediaPipe -->
+    <video id="input-video"></video>
+
+    <!-- Three.js Canvas Container -->
+    <div id="canvas-container"></div>
+
+    <script>
+        // --- Configuration ---
+        const PARTICLE_COUNT = 75000;
+        const PLANET_RADIUS = 15;
+        const RING_INNER_RADIUS = 20;
+        const RING_OUTER_RADIUS = 45;
+        
+        // --- Globals ---
+        let scene, camera, renderer, material, points;
+        let statsFps = document.getElementById('fps-counter');
+        let statusText = document.getElementById('status-text');
+        let loadingScreen = document.getElementById('loading');
+        
+        // Interaction State
+        const state = {
+            dispersion: 0.0,      // 0 = formed, 1 = exploded
+            targetDispersion: 0.0,
+            rotationX: 0,
+            rotationY: 0,
+            targetRotationX: 0,
+            targetRotationY: 0,
+            handDetected: false
+        };
+
+        // --- Shaders ---
+        const vertexShader = `
+            uniform float uTime;
+            uniform float uDispersion;
+            
+            attribute vec3 basePosition;
+            attribute vec3 randomDir;
+            attribute float size;
+            attribute vec3 color;
+            
+            varying vec3 vColor;
+            
+            // Simple noise function
+            float random(vec2 st) {
+                return fract(sin(dot(st.xy, vec2(12.9898,78.233))) * 43758.5453123);
+            }
+
+            void main() {
+                vColor = color;
+                
+                // Generate a deterministic random value per particle based on its base position
+                float rnd = random(basePosition.xy);
+                
+                // Calculate exploded position
+                // Vary the explosion distance per particle for a cloud effect (organic)
+                // Some particles fly 20 units, some up to 80 units
+                float explosionFactor = uDispersion * (20.0 + 60.0 * rnd); 
+                
+                vec3 explodedPos = basePosition + (randomDir * explosionFactor);
+                
+                // Add some curl/noise when moving using sine waves
+                float noise = sin(uTime * 2.0 + basePosition.x) * 0.5;
+                
+                // Lerp between base and exploded
+                vec3 finalPos = mix(basePosition, explodedPos, uDispersion);
+                
+                // Add turbulent noise when exploded
+                if (uDispersion > 0.01) {
+                    finalPos.x += sin(uTime * 3.0 + basePosition.y * 0.5) * uDispersion;
+                    finalPos.y += cos(uTime * 2.5 + basePosition.z * 0.5) * uDispersion;
+                    finalPos.z += sin(uTime * 3.5 + basePosition.x * 0.5) * uDispersion;
+                }
+
+                vec4 mvPosition = modelViewMatrix * vec4(finalPos, 1.0);
+                
+                // Size attenuation
+                gl_PointSize = size * (300.0 / -mvPosition.z);
+                
+                gl_Position = projectionMatrix * mvPosition;
+            }
+        `;
+
+        const fragmentShader = `
+            varying vec3 vColor;
+            
+            void main() {
+                // Circular particle
+                vec2 coord = gl_PointCoord - vec2(0.5);
+                if(length(coord) > 0.5) discard;
+                
+                // Soft edge glow
+                float strength = 1.0 - (length(coord) * 2.0);
+                strength = pow(strength, 1.5);
+                
+                gl_FragColor = vec4(vColor, strength); // Use alpha for blending
+            }
+        `;
+
+        // --- Three.js Initialization ---
+        function initThree() {
+            const container = document.getElementById('canvas-container');
+            
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x000000, 0.002);
+
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 80;
+            camera.position.y = 20;
+            camera.lookAt(0, 0, 0);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            container.appendChild(renderer.domElement);
+
+            // Geometry
+            const geometry = new THREE.BufferGeometry();
+            const positions = [];
+            const basePositions = [];
+            const randomDirs = [];
+            const colors = [];
+            const sizes = [];
+
+            const colorCore1 = new THREE.Color(0xFFD700); // Gold
+            const colorCore2 = new THREE.Color(0xFFA500); // Orange
+            const colorRing1 = new THREE.Color(0xADD8E6); // Light Blue
+            const colorRing2 = new THREE.Color(0xFFFFFF); // White
+
+            // Generate Particles
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                let x, y, z, r, g, b, size;
+                let isRing = Math.random() > 0.4; // 60% ring, 40% core
+
+                if (!isRing) {
+                    // Core Sphere
+                    // Uniform distribution in sphere
+                    const theta = Math.random() * Math.PI * 2;
+                    const phi = Math.acos((Math.random() * 2) - 1);
+                    const rad = PLANET_RADIUS * Math.cbrt(Math.random()); // cbrt for uniform volume
+
+                    x = rad * Math.sin(phi) * Math.cos(theta);
+                    y = rad * Math.sin(phi) * Math.sin(theta);
+                    z = rad * Math.cos(phi);
+
+                    // Flatten slightly for planet shape
+                    y *= 0.9;
+
+                    const c = Math.random() > 0.5 ? colorCore1 : colorCore2;
+                    r = c.r; g = c.g; b = c.b;
+                    size = Math.random() * 1.5 + 0.5;
+
+                } else {
+                    // Ring
+                    const theta = Math.random() * Math.PI * 2;
+                    // Biased towards inner rings for nicer look
+                    const rad = RING_INNER_RADIUS + Math.random() * (RING_OUTER_RADIUS - RING_INNER_RADIUS);
+                    
+                    x = rad * Math.cos(theta);
+                    z = rad * Math.sin(theta);
+                    y = (Math.random() - 0.5) * 0.5; // Very thin flat disc
+
+                    // Apply ring gaps logic (simple bands)
+                    if ((rad > 28 && rad < 32) || (rad > 38 && rad < 40)) {
+                         // Less particles in gaps
+                         if (Math.random() > 0.2) {
+                             i--; continue; 
+                         }
+                    }
+
+                    const c = Math.random() > 0.5 ? colorRing1 : colorRing2;
+                    r = c.r; g = c.g; b = c.b;
+                    size = Math.random() * 1.0 + 0.2;
+                }
+
+                positions.push(x, y, z);
+                basePositions.push(x, y, z);
+                
+                // Random Direction for explosion (outward from center)
+                const v = new THREE.Vector3(x, y, z).normalize();
+                // Add some noise to direction
+                v.x += (Math.random() - 0.5);
+                v.y += (Math.random() - 0.5);
+                v.z += (Math.random() - 0.5);
+                v.normalize();
+                
+                randomDirs.push(v.x, v.y, v.z);
+                
+                colors.push(r, g, b);
+                sizes.push(size);
+            }
+
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geometry.setAttribute('basePosition', new THREE.Float32BufferAttribute(basePositions, 3));
+            geometry.setAttribute('randomDir', new THREE.Float32BufferAttribute(randomDirs, 3));
+            geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+            geometry.setAttribute('size', new THREE.Float32BufferAttribute(sizes, 1));
+
+            material = new THREE.ShaderMaterial({
+                uniforms: {
+                    uTime: { value: 0 },
+                    uDispersion: { value: 0 }
+                },
+                vertexShader: vertexShader,
+                fragmentShader: fragmentShader,
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            });
+
+            points = new THREE.Points(geometry, material);
+            // Tilt the whole system to make rings visible nicely
+            points.rotation.z = Math.PI / 8; 
+            points.rotation.x = Math.PI / 6;
+            
+            scene.add(points);
+
+            window.addEventListener('resize', onWindowResize, false);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // --- MediaPipe & Interaction ---
+        function initMediaPipe() {
+            const videoElement = document.getElementById('input-video');
+            
+            const hands = new Hands({locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+            }});
+
+            hands.setOptions({
+                maxNumHands: 1,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.5,
+                minTrackingConfidence: 0.5
+            });
+
+            hands.onResults(onResults);
+
+            const cameraUtils = new Camera(videoElement, {
+                onFrame: async () => {
+                    await hands.send({image: videoElement});
+                },
+                width: 320,
+                height: 240
+            });
+
+            cameraUtils.start()
+                .then(() => {
+                    console.log("Camera started");
+                    loadingScreen.style.display = 'none';
+                    statusText.innerText = "SYSTEM: ONLINE // WAITING FOR INPUT";
+                })
+                .catch(err => {
+                    console.error(err);
+                    loadingScreen.innerHTML = "CAMERA ERROR<br>Check permissions";
+                });
+        }
+
+        function onResults(results) {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                state.handDetected = true;
+                statusText.innerText = "SYSTEM: TRACKING";
+                statusText.style.color = "#0f0";
+                
+                const landmarks = results.multiHandLandmarks[0];
+                
+                // --- 1. Interaction: Rotation (Centroid) ---
+                // Calculate rough centroid (Wrist + Middle Finger Base + Index Base) / 3
+                // Using simple average of all points is stable enough
+                let cx = 0, cy = 0;
+                for(let lm of landmarks) {
+                    cx += lm.x;
+                    cy += lm.y;
+                }
+                cx /= landmarks.length;
+                cy /= landmarks.length;
+
+                // Map 0..1 to -PI..PI range (inverted X for mirror effect)
+                // video is mirrored via CSS, landmarks x=0 is left of canvas (our right)
+                // Let's map x (0..1) -> rotation Y (-1..1)
+                state.targetRotationY = (cx - 0.5) * 3.0; 
+                state.targetRotationX = (cy - 0.5) * 2.0;
+
+                // --- 2. Interaction: Explosion (Spread) ---
+                // Measure distance between Thumb Tip (4) and Pinky Tip (20)
+                const thumbTip = landmarks[4];
+                const pinkyTip = landmarks[20];
+                const wrist = landmarks[0];
+                const middleFingerMCP = landmarks[9];
+
+                // Calculate hand size reference (Wrist to Middle MCP) to normalize
+                const handSize = Math.sqrt(
+                    Math.pow(wrist.x - middleFingerMCP.x, 2) +
+                    Math.pow(wrist.y - middleFingerMCP.y, 2)
+                );
+                
+                const spreadDist = Math.sqrt(
+                    Math.pow(thumbTip.x - pinkyTip.x, 2) +
+                    Math.pow(thumbTip.y - pinkyTip.y, 2)
+                );
+
+                // Ratio > 1.5 usually means open hand, < 0.8 means fist/pinch
+                // We'll map ratio 0.5 (closed) to 1.8 (open) -> 0.0 to 1.0
+                let openness = (spreadDist / handSize);
+                
+                // Clamp and map
+                // Tuned values based on typical hand proportions
+                let explosionVal = (openness - 0.8) / (1.8 - 0.8);
+                explosionVal = Math.max(0, Math.min(1, explosionVal));
+
+                state.targetDispersion = explosionVal;
+
+            } else {
+                state.handDetected = false;
+                statusText.innerText = "SYSTEM: SCANNING...";
+                statusText.style.color = "#aaa";
+                
+                // Slowly return to idle state if hand lost
+                state.targetDispersion = 0.0;
+                state.targetRotationX = 0;
+                state.targetRotationY = 0;
+            }
+        }
+
+        // --- Animation Loop ---
+        let lastTime = 0;
+        let frameCount = 0;
+        let lastFpsTime = 0;
+
+        function animate(time) {
+            requestAnimationFrame(animate);
+
+            const delta = (time - lastTime) / 1000;
+            lastTime = time;
+
+            // FPS Counter
+            frameCount++;
+            if (time - lastFpsTime >= 1000) {
+                statsFps.innerText = frameCount;
+                frameCount = 0;
+                lastFpsTime = time;
+            }
+
+            if (material) {
+                material.uniforms.uTime.value = time / 1000;
+
+                // Smooth Interpolation for Physics
+                const lerpFactor = 0.1; // Speed of reaction
+                
+                // Smooth Dispersion
+                state.dispersion += (state.targetDispersion - state.dispersion) * lerpFactor;
+                material.uniforms.uDispersion.value = state.dispersion;
+
+                // Smooth Rotation
+                state.rotationX += (state.targetRotationX - state.rotationX) * lerpFactor;
+                state.rotationY += (state.targetRotationY - state.rotationY) * lerpFactor;
+
+                // Apply Rotation to Scene container
+                // We keep the base tilt (Z and X) and add user rotation
+                // Using a group or just rotating the points object carefully
+                // Let's rotate the points object relative to its base rotation
+                
+                // Base rotation: z = PI/8, x = PI/6
+                // We add offset
+                points.rotation.y = state.rotationY;
+                points.rotation.x = (Math.PI / 6) + state.rotationX;
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // --- Start ---
+        initThree();
+        initMediaPipe();
+        animate(0);
+
+    </script>
+</body>
+</html>
